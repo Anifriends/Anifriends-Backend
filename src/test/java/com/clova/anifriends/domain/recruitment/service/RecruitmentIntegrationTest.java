@@ -63,6 +63,8 @@ public class RecruitmentIntegrationTest extends BaseIntegrationTest {
             Recruitment recruitment = RecruitmentFixture.recruitment(shelter);
             shelterRepository.save(shelter);
             recruitmentRepository.save(recruitment);
+            recruitmentCacheRepository.saveRecruitment(recruitment);
+            long count = recruitmentCacheRepository.getTotalNumberOfRecruitments();
 
             // when
             recruitmentService.registerRecruitment(
@@ -77,8 +79,8 @@ public class RecruitmentIntegrationTest extends BaseIntegrationTest {
             );
 
             // then
-            assertThat(recruitmentRepository.count()).isEqualTo(
-                recruitmentCacheRepository.getRecruitmentCount());
+            assertThat(recruitmentCacheRepository.getTotalNumberOfRecruitments())
+                .isEqualTo(count + 1);
         }
     }
 
@@ -179,6 +181,7 @@ public class RecruitmentIntegrationTest extends BaseIntegrationTest {
             // given
             Recruitment recruitment = RecruitmentFixture.recruitment(shelter);
             Recruitment savedRecruitment = recruitmentRepository.save(recruitment);
+            long count = recruitmentCacheRepository.getTotalNumberOfRecruitments();
 
             // when
             recruitmentService.deleteRecruitment(
@@ -188,7 +191,7 @@ public class RecruitmentIntegrationTest extends BaseIntegrationTest {
 
             // then
             assertThat(recruitmentRepository.count()).isEqualTo(
-                recruitmentCacheRepository.getRecruitmentCount());
+                recruitmentCacheRepository.getTotalNumberOfRecruitments());
         }
     }
 

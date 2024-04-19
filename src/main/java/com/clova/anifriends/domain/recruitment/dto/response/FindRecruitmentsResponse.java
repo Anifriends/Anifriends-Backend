@@ -11,12 +11,6 @@ public record FindRecruitmentsResponse(
     List<FindRecruitmentResponse> recruitments,
     PageInfo pageInfo) {
 
-    public static FindRecruitmentsResponse fromCached(
-        Slice<FindRecruitmentResponse> cachedRecruitments, Long count) {
-        PageInfo pageInfo = PageInfo.of(count, cachedRecruitments.hasNext());
-        return new FindRecruitmentsResponse(cachedRecruitments.getContent(), pageInfo);
-    }
-
     public record FindRecruitmentResponse(
         Long recruitmentId,
         String recruitmentTitle,

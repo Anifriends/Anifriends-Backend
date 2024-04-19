@@ -1,6 +1,8 @@
 package com.clova.anifriends.domain.recruitment.repository;
 
+import com.clova.anifriends.domain.common.PageInfo;
 import com.clova.anifriends.domain.recruitment.Recruitment;
+import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse;
 import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse.FindRecruitmentResponse;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -8,11 +10,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
-import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Slice;
-import org.springframework.data.domain.SliceImpl;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.data.redis.core.ZSetOperations;
@@ -24,10 +24,7 @@ public class RecruitmentRedisRepository implements RecruitmentCacheRepository {
     private static final String RECRUITMENT_KEY = "recruitment";
     private static final String RECRUITMENT_COUNT_KEY = "recruitment:count";
     private static final int UNTIL_LAST_ELEMENT = -1;
-    private static final Long RECRUITMENT_COUNT_NO_CACHE = -1L;
-    private static final Long COUNT_ONE = 1L;
     private static final int MAX_CACHED_SIZE = 30;
-    private static final int PAGE_SIZE = 20;
     private static final int ZERO = 0;
     public static final ZoneOffset CREATED_AT_SCORE_TIME_ZONE = ZoneOffset.UTC;
 
@@ -43,89 +40,82 @@ public class RecruitmentRedisRepository implements RecruitmentCacheRepository {
         this.recruitmentRepository = recruitmentRepository;
     }
 
+    /**
+     * 봉사 모집글을 캐시에 저장하고 캐싱된 카운트를 증가시킵니다.
+     *
+     * @param recruitment
+     */
     @Override
     public void saveRecruitment(final Recruitment recruitment) {
         FindRecruitmentResponse recruitmentResponse = FindRecruitmentResponse.from(recruitment);
         long createdAtScore = getCreatedAtScore(recruitment);
         cachedRecruitments.add(RECRUITMENT_KEY, recruitmentResponse, createdAtScore);
-
-        popUntilCachedSize();
-    }
-
-    private void popUntilCachedSize() {
-        Set<FindRecruitmentResponse> recruitments
-            = cachedRecruitments.range(RECRUITMENT_KEY, ZERO, UNTIL_LAST_ELEMENT);
-        if (Objects.nonNull(recruitments)) {
-            int needToRemoveSize = recruitments.size() - MAX_CACHED_SIZE;
-            needToRemoveSize = Math.max(needToRemoveSize, ZERO);
-            cachedRecruitments.popMin(RECRUITMENT_KEY, needToRemoveSize);
-        }
-    }
-
-    /**
-     * 캐시된 Recruitment dto 리스트를 size만큼 조회합니다. size가 지정된 최대 size를 초과하는 경우 지정된 최대 size만큼 조회해옵니다.
-     *
-     * @param pageable 조회해 올 리스트 pageable. 최대 사이즈 20
-     * @return 캐시된 Recruitment dto 리스트
-     */
-    @Override
-    public Slice<FindRecruitmentResponse> findRecruitments(Pageable pageable) {
-        long size = pageable.getPageSize();
-        if (size > PAGE_SIZE) {
-            size = PAGE_SIZE;
-        }
-        Set<FindRecruitmentResponse> recruitments
-            = cachedRecruitments.reverseRange(RECRUITMENT_KEY, ZERO, size);
-        if (Objects.isNull(recruitments)) {
-            return new SliceImpl<>(List.of());
-        }
-        List<FindRecruitmentResponse> content = recruitments.stream()
-            .limit(size)
-            .toList();
-        boolean hasNext = recruitments.size() > size;
-        return new SliceImpl<>(content, pageable, hasNext);
-    }
-
-    @Override
-    public void updateRecruitment(final Recruitment recruitment) {
-        long createdAtScore = getCreatedAtScore(recruitment);
-        Set<FindRecruitmentResponse> recruitments = cachedRecruitments.rangeByScore(
-            RECRUITMENT_KEY, createdAtScore, createdAtScore);
-        if (Objects.nonNull(recruitments)) {
-            Optional<FindRecruitmentResponse> oldCachedRecruitment = recruitments.stream()
-                .filter(findRecruitmentResponse -> isEqualsId(recruitment, findRecruitmentResponse))
-                .findFirst();
-            oldCachedRecruitment.ifPresent(oldRecruitment -> {
-                cachedRecruitments.remove(RECRUITMENT_KEY, oldRecruitment);
-                FindRecruitmentResponse updatedRecruitment
-                    = FindRecruitmentResponse.from(recruitment);
-                cachedRecruitments.add(RECRUITMENT_KEY, updatedRecruitment, createdAtScore);
-            });
-        }
+        cachedRecruitmentsCount.increment(RECRUITMENT_COUNT_KEY);
+        trimCache();
     }
 
     private long getCreatedAtScore(Recruitment recruitment) {
         return recruitment.getCreatedAt().toEpochSecond(CREATED_AT_SCORE_TIME_ZONE);
     }
 
-    private boolean isEqualsId(
-        Recruitment recruitment,
-        FindRecruitmentResponse findRecruitmentResponse) {
-        return findRecruitmentResponse.recruitmentId().equals(recruitment.getRecruitmentId());
+    private void trimCache() {
+        cachedRecruitments.removeRange(RECRUITMENT_KEY, ZERO, -MAX_CACHED_SIZE - 1L);
     }
 
+    /**
+     * 캐시된 Recruitment dto 리스트를 첫번째 요소부터 size만큼 조회합니다. size가 최대 캐싱 사이즈를 초과하는 경우 db에서 조회합니다.
+     *
+     * @param size 조회할 사이즈
+     * @return FindRecruitmentsResponse 캐시 혹은 db에서 조회한 결과
+     */
     @Override
-    public void deleteRecruitment(final Recruitment recruitment) {
-        FindRecruitmentResponse recruitmentResponse = FindRecruitmentResponse.from(recruitment);
-        cachedRecruitments.remove(RECRUITMENT_KEY, recruitmentResponse);
+    public FindRecruitmentsResponse findRecruitments(int size) {
+        Set<FindRecruitmentResponse> recruitments = Objects.requireNonNull(
+            cachedRecruitments.reverseRange(RECRUITMENT_KEY, ZERO, size - 1L));
+        long count = getTotalNumberOfRecruitments();
+        PageInfo pageInfo = PageInfo.of(count, count > size);
+        if (recruitments.size() >= size) {
+            List<FindRecruitmentResponse> content = recruitments.stream()
+                .limit(size)
+                .toList();
+            return new FindRecruitmentsResponse(content, pageInfo);
+        }
+
+        PageRequest pageRequest = PageRequest.of(ZERO, size);
+        List<FindRecruitmentResponse> content = getRecruitmentsV2(pageRequest)
+            .map(FindRecruitmentResponse::from)
+            .toList();
+        return new FindRecruitmentsResponse(content, pageInfo);
     }
 
+    private Slice<Recruitment> getRecruitmentsV2(PageRequest pageRequest) {
+        return recruitmentRepository.findRecruitmentsV2(null, null,
+            null, null, null, null, null, pageRequest);
+    }
+
+    /**
+     * 캐시된 봉사 모집글을 제거하고 카운트를 감소시킵니다.
+     *
+     * @param recruitment
+     * @return
+     */
+    @Override
+    public long deleteRecruitment(final Recruitment recruitment) {
+        FindRecruitmentResponse recruitmentResponse = FindRecruitmentResponse.from(recruitment);
+        Long number = cachedRecruitments.remove(RECRUITMENT_KEY, recruitmentResponse);
+        cachedRecruitmentsCount.decrement(RECRUITMENT_COUNT_KEY);
+        return Objects.isNull(number) ? 0 : number;
+    }
+
+    /**
+     * 캐시된 봉사 모집글 중 모집 기간이 종료된 요소를 업데이트합니다.
+     */
     @Override
     public void closeRecruitmentsIfNeedToBe() {
         LocalDateTime now = LocalDateTime.now();
         Set<FindRecruitmentResponse> findRecruitments = cachedRecruitments.range(RECRUITMENT_KEY,
             ZERO, UNTIL_LAST_ELEMENT);
-        if(Objects.nonNull(findRecruitments)) {
+        if (Objects.nonNull(findRecruitments)) {
             Map<FindRecruitmentResponse, FindRecruitmentResponse> cachedKeyAndUpdatedValue
                 = new HashMap<>();
             findRecruitments.stream()
@@ -169,50 +159,13 @@ public class RecruitmentRedisRepository implements RecruitmentCacheRepository {
     }
 
     @Override
-    public Long getRecruitmentCount() {
+    public long getTotalNumberOfRecruitments() {
         Object cachedCount = cachedRecruitmentsCount.get(RECRUITMENT_COUNT_KEY);
-
-        if (Objects.isNull(cachedCount)) {
-            return RECRUITMENT_COUNT_NO_CACHE;
-        }
-
-        if (cachedCount instanceof Long) {
-            return (Long) cachedCount;
-        } else {
+        if (Objects.nonNull(cachedCount)) {
             return ((Integer) cachedCount).longValue();
         }
-    }
-
-    @Override
-    public void saveRecruitmentCount(
-        Long count
-    ) {
-        cachedRecruitmentsCount.set(RECRUITMENT_COUNT_KEY, count);
-    }
-
-    @Override
-    public void increaseRecruitmentCount() {
-        Object cachedCount = cachedRecruitmentsCount.get(RECRUITMENT_COUNT_KEY);
-
-        if (Objects.nonNull(cachedCount)) {
-            saveRecruitmentCount((Integer) cachedCount + COUNT_ONE);
-        }
-
-        long dbRecruitmentCount = recruitmentRepository.count();
-
-        saveRecruitmentCount(dbRecruitmentCount);
-    }
-
-    @Override
-    public void decreaseToRecruitmentCount() {
-        Object cachedCount = cachedRecruitmentsCount.get(RECRUITMENT_COUNT_KEY);
-
-        if (Objects.nonNull(cachedCount)) {
-            saveRecruitmentCount((Integer) cachedCount - COUNT_ONE);
-        }
-
-        long dbRecruitmentCount = recruitmentRepository.count();
-
-        saveRecruitmentCount(dbRecruitmentCount);
+        long dbCount = recruitmentRepository.count();
+        cachedRecruitmentsCount.set(RECRUITMENT_COUNT_KEY, dbCount);
+        return dbCount;
     }
 }

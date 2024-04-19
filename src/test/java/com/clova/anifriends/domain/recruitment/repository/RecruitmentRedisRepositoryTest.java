@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.clova.anifriends.base.BaseIntegrationTest;
 import com.clova.anifriends.domain.recruitment.Recruitment;
+import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse;
 import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse.FindRecruitmentResponse;
 import com.clova.anifriends.domain.recruitment.support.fixture.RecruitmentFixture;
 import com.clova.anifriends.domain.recruitment.vo.RecruitmentInfo;
@@ -16,6 +17,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,7 +28,6 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Slice;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -50,8 +53,8 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
     }
 
     @Nested
-    @DisplayName("pushNewRecruitment 메서드 호출 시")
-    class PushNewRecruitment {
+    @DisplayName("saveRecruitment 메서드 호출 시")
+    class SaveRecruitmentTest {
 
         Shelter shelter;
 
@@ -73,13 +76,30 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
 
             //then
             PageRequest pageRequest = PageRequest.of(0, 20);
-            Slice<FindRecruitmentResponse> recruitments = recruitmentRedisRepository.findRecruitments(
-                pageRequest);
-            List<FindRecruitmentResponse> content = recruitments.getContent();
+            FindRecruitmentsResponse response = recruitmentRedisRepository.findRecruitments(
+                pageRequest.getPageSize()
+            );
+            List<FindRecruitmentResponse> content = response.recruitments();
             assertThat(content).hasSize(1);
             FindRecruitmentResponse recruitmentResponse = content.get(0);
             assertThat(recruitmentResponse.recruitmentId())
                 .isEqualTo(recruitment.getRecruitmentId());
+        }
+
+        @Test
+        @DisplayName("성공: 카운트 값이 1 증가한다.")
+        void increaseCachedCount() {
+            //given
+            Recruitment recruitment = RecruitmentFixture.recruitment(shelter);
+            recruitmentRepository.save(recruitment);
+            long cachedCount = recruitmentRedisRepository.getTotalNumberOfRecruitments();
+
+            //when
+            recruitmentRedisRepository.saveRecruitment(recruitment);
+
+            //then
+            assertThat(recruitmentRedisRepository.getTotalNumberOfRecruitments())
+                .isEqualTo(cachedCount + 1);
         }
 
         @Test
@@ -103,9 +123,9 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
 
             //then
             List<Long> recruitmentIdsDesc = recruitments.stream()
+                .sorted((a, b) -> b.getCreatedAt().compareTo(a.getCreatedAt()))
+                .limit(30)
                 .map(Recruitment::getRecruitmentId)
-                .filter(i -> i > 70)
-                .sorted(Comparator.reverseOrder())
                 .toList();
 
             Set<FindRecruitmentResponse> findRecruitments = redisTemplate.opsForZSet()
@@ -113,13 +133,49 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
             assertThat(findRecruitments).hasSize(30);
             assertThat(findRecruitments).map(FindRecruitmentResponse::recruitmentId)
                 .containsExactlyElementsOf(recruitmentIdsDesc);
+        }
 
+        @Test
+        @DisplayName("성공: 동시에 새로운 봉사 모집글이 추가되는 경우 손실되지 않는다.")
+        void doseNotLost() throws InterruptedException {
+            //given
+            int count = 100;
+            int cachedSize = 30;
+            List<Recruitment> recruitments = IntStream.range(0, count)
+                .mapToObj(i -> RecruitmentFixture.recruitment(shelter))
+                .toList();
+            recruitmentRepository.saveAll(recruitments);
+            LocalDateTime now = LocalDateTime.now();
+            int hour = 0;
+            for (Recruitment recruitment : recruitments) {
+                ReflectionTestUtils.setField(recruitment, "createdAt", now.plusHours(hour++));
+            }
 
+            ExecutorService executorService = Executors.newFixedThreadPool(count);
+            CountDownLatch latch = new CountDownLatch(count);
+
+            //when
+            for(int i=0; i<count; i++) {
+                int finalI = i;
+                executorService.submit(() -> {
+                    try {
+                        recruitmentRedisRepository.saveRecruitment(recruitments.get(finalI));
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            latch.await();
+
+            //then
+            Set<FindRecruitmentResponse> result = redisTemplate.opsForZSet()
+                .range(RECRUITMENT_KEY, ZERO, ALL_ELEMENT);
+            assertThat(result).hasSize(cachedSize);
         }
     }
 
     @Nested
-    @DisplayName("findAll 메서드 호출 시")
+    @DisplayName("findRecruitments 메서드 호출 시")
     class FindAllTest {
 
         Shelter shelter;
@@ -131,22 +187,22 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
         }
 
         @Test
-        @DisplayName("성공: 캐싱된 목록이 없을 시 빈 리스트 반환")
+        @DisplayName("성공: 봉사 모집글이 없으면 빈 리스트를 반환한다.")
         void findAllWhenEmpty() {
             //given
             PageRequest pageRequest = PageRequest.of(0, 20);
 
             //when
-            Slice<FindRecruitmentResponse> recruitments = recruitmentRedisRepository.findRecruitments(
-                pageRequest);
+            FindRecruitmentsResponse response = recruitmentRedisRepository.findRecruitments(
+                pageRequest.getPageSize()
+            );
 
             //then
-            assertThat(recruitments.getContent())
-                .isEmpty();
+            assertThat(response.recruitments()).isEmpty();
         }
 
         @Test
-        @DisplayName("성공: 캐싱된 목록이 있을 시 캐싱된 리스트 반환")
+        @DisplayName("성공: 봉사 모집글이 있으면 사이즈 조회하여 반환한다.")
         void findAllWhenCached() {
             //given
             List<Recruitment> recruitments = new ArrayList<>();
@@ -165,8 +221,9 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
             PageRequest pageRequest = PageRequest.of(0, 20);
 
             //when
-            Slice<FindRecruitmentResponse> cachedRecruitments
-                = recruitmentRedisRepository.findRecruitments(pageRequest);
+            FindRecruitmentsResponse response = recruitmentRedisRepository.findRecruitments(
+                pageRequest.getPageSize()
+            );
 
             //then
             List<Long> recruitmentIdsDesc = recruitments.stream()
@@ -175,17 +232,17 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
                 .sorted(Comparator.reverseOrder())
                 .toList();
 
-            assertThat(cachedRecruitments.getContent())
+            assertThat(response.recruitments())
                 .hasSize(20)
                 .map(FindRecruitmentResponse::recruitmentId)
                 .containsExactlyElementsOf(recruitmentIdsDesc);
         }
 
         @Test
-        @DisplayName("성공: 캐싱된 목록은 최대 20개까지만 조회 가능")
-        void findAllMax20() {
+        @DisplayName("성공: 캐싱할 최대 크기보다 크면 DB에서 조회한다.")
+        void findAllOverMaxCacheSize_ThenFindDB() {
             //given
-            int pageSize = 30;
+            int pageSize = 50;
             PageRequest pageRequest = PageRequest.of(0, pageSize);
             List<Recruitment> recruitments = RecruitmentFixture.recruitments(shelter, 100);
             recruitmentRepository.saveAll(recruitments);
@@ -197,108 +254,13 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
             }
 
             //when
-            Slice<FindRecruitmentResponse> cachedRecruitments = recruitmentRedisRepository.findRecruitments(
-                pageRequest);
+            FindRecruitmentsResponse response = recruitmentRedisRepository.findRecruitments(
+                pageRequest.getPageSize()
+            );
 
             //then
-            assertThat(cachedRecruitments.getContent())
-                .hasSizeLessThan(pageSize)
-                .hasSize(20);
-            assertThat(cachedRecruitments.hasNext()).isTrue();
-        }
-
-        @Test
-        @DisplayName("성공: 캐싱된 목록이 요청 개수 이하인 경우 hasNext는 false")
-        void findAllWhenLTRequestPageSizeThenHasNextIsFalse() {
-            //given
-            int pageSize = 10;
-            PageRequest pageRequest = PageRequest.of(0, pageSize);
-            List<Recruitment> recruitments = RecruitmentFixture.recruitments(shelter, 10);
-            recruitmentRepository.saveAll(recruitments);
-            int hour = 0;
-            LocalDateTime now = LocalDateTime.now();
-            for (Recruitment recruitment : recruitments) {
-                ReflectionTestUtils.setField(recruitment, "createdAt", now.plusHours(hour++));
-                recruitmentRedisRepository.saveRecruitment(recruitment);
-            }
-
-            //when
-            Slice<FindRecruitmentResponse> cachedRecruitments = recruitmentRedisRepository.findRecruitments(
-                pageRequest);
-
-            //then
-            assertThat(cachedRecruitments.hasNext()).isFalse();
-        }
-    }
-
-    @Nested
-    @DisplayName("updateCachedRecruitments 메서드 호출 시")
-    class UpdateCachedRecruitmentsTest {
-
-        Shelter shelter;
-        List<Recruitment> recruitments;
-
-        @BeforeEach
-        void setUp() {
-            shelter = ShelterFixture.shelter();
-            shelterRepository.save(shelter);
-            recruitments = RecruitmentFixture.recruitments(shelter, 40);
-            recruitmentRepository.saveAll(recruitments);
-        }
-
-        @Test
-        @DisplayName("성공: 캐시된 Recruitment 업데이트 됨")
-        void updateCachedRecruitment() {
-            //given
-            int hour = 0;
-            LocalDateTime now = LocalDateTime.now();
-            for (Recruitment recruitment : recruitments) {
-                ReflectionTestUtils.setField(recruitment, "createdAt", now.plusHours(hour++));
-                recruitmentRedisRepository.saveRecruitment(recruitment);
-            }
-            Recruitment needToUpdateRecruitment = recruitments.get(20);
-            FindRecruitmentResponse oldCachedRecruitment
-                = FindRecruitmentResponse.from(needToUpdateRecruitment);
-            needToUpdateRecruitment.updateRecruitment("update", null, null, null, null, null, null);
-
-            //when
-            recruitmentRedisRepository.updateRecruitment(needToUpdateRecruitment);
-
-            //then
-            PageRequest pageRequest = PageRequest.of(0, 20);
-            Slice<FindRecruitmentResponse> cachedRecruitments = recruitmentRedisRepository.findRecruitments(
-                pageRequest);
-            FindRecruitmentResponse newCachedRecruitment
-                = FindRecruitmentResponse.from(needToUpdateRecruitment);
-            assertThat(cachedRecruitments.getContent())
-                .contains(newCachedRecruitment)
-                .doesNotContain(oldCachedRecruitment);
-        }
-
-        @Test
-        @DisplayName("성공: 캐시된 Recruitment 없는 경우 무시됨")
-        void ignoreIfCachedRecruitmentDoesNotExists() {
-            //given
-            int hour = 0;
-            LocalDateTime now = LocalDateTime.now();
-            for (Recruitment recruitment : recruitments) {
-                ReflectionTestUtils.setField(recruitment, "createdAt", now.plusHours(hour++));
-                recruitmentRedisRepository.saveRecruitment(recruitment);
-            }
-            Recruitment needToUpdateRecruitment = recruitments.get(0);
-            needToUpdateRecruitment.updateRecruitment("update", null, null, null, null, null, null);
-
-            //when
-            recruitmentRedisRepository.updateRecruitment(needToUpdateRecruitment);
-
-            //then
-            long createdAtScore
-                = needToUpdateRecruitment.getCreatedAt().toEpochSecond(ZoneOffset.UTC);
-            ZSetOperations<String, FindRecruitmentResponse> cachedRecruitments
-                = redisTemplate.opsForZSet();
-            Set<FindRecruitmentResponse> recruitments = cachedRecruitments.rangeByScore(
-                RECRUITMENT_KEY, createdAtScore, createdAtScore);
-            assertThat(recruitments).isEmpty();
+            assertThat(response.recruitments()).hasSize(50);
+            assertThat(response.pageInfo().hasNext()).isTrue();
         }
     }
 
@@ -332,6 +294,23 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
             Set<FindRecruitmentResponse> recruitments = cachedRecruitments.rangeByScore(
                 RECRUITMENT_KEY, createdAtScore, createdAtScore);
             assertThat(recruitments).isEmpty();
+        }
+
+        @Test
+        @DisplayName("성공: 카운트 값이 1 감소한다.")
+        void decreaseCachedCount() {
+            //given
+            Recruitment recruitment = RecruitmentFixture.recruitment(shelter);
+            recruitmentRepository.save(recruitment);
+            recruitmentRedisRepository.saveRecruitment(recruitment);
+            long cachedCount = recruitmentRedisRepository.getTotalNumberOfRecruitments();
+
+            //when
+            recruitmentRedisRepository.deleteRecruitment(recruitment);
+
+            //then
+            assertThat(recruitmentRedisRepository.getTotalNumberOfRecruitments())
+                .isEqualTo(cachedCount - 1);
         }
 
         @Test
@@ -428,11 +407,11 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
     }
 
     @Nested
-    @DisplayName("getRecruitmentsCount 메서드 호출 시")
+    @DisplayName("getTotalNumberOfRecruitments 메서드 호출 시")
     class GetRecruitmentsCountTest {
 
         @Test
-        @DisplayName("성공: redis에 없으면 -1을 반환한다.")
+        @DisplayName("성공: 요소의 총 개수를 반환한다.")
         void getCachedRecruitmentCountWhenNotExistInRedis() {
             // given
             Shelter shelter = ShelterFixture.shelter();
@@ -441,10 +420,10 @@ class RecruitmentRedisRepositoryTest extends BaseIntegrationTest {
             recruitmentRepository.save(recruitment);
 
             // when
-            Long recruitmentCount = recruitmentRedisRepository.getRecruitmentCount();
+            Long recruitmentCount = recruitmentRedisRepository.getTotalNumberOfRecruitments();
 
             // then
-            assertThat(recruitmentCount).isEqualTo(-1L);
+            assertThat(recruitmentCount).isEqualTo(1);
         }
     }
 }

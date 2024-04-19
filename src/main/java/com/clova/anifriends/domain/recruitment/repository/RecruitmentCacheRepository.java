@@ -1,27 +1,17 @@
 package com.clova.anifriends.domain.recruitment.repository;
 
 import com.clova.anifriends.domain.recruitment.Recruitment;
-import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse.FindRecruitmentResponse;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Slice;
+import com.clova.anifriends.domain.recruitment.dto.response.FindRecruitmentsResponse;
 
 public interface RecruitmentCacheRepository {
 
+    long getTotalNumberOfRecruitments();
+
     void saveRecruitment(Recruitment recruitment);
 
-    Slice<FindRecruitmentResponse> findRecruitments(Pageable pageable);
+    long deleteRecruitment(Recruitment recruitment);
 
-    void updateRecruitment(Recruitment recruitment);
-
-    void deleteRecruitment(Recruitment recruitment);
+    FindRecruitmentsResponse findRecruitments(int size);
 
     void closeRecruitmentsIfNeedToBe();
-
-    Long getRecruitmentCount();
-
-    void saveRecruitmentCount(Long count);
-
-    void increaseRecruitmentCount();
-
-    void decreaseToRecruitmentCount();
 }
