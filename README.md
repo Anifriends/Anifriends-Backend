@@ -29,10 +29,10 @@
     </tr>
     <tr align="center">
         <td>
-            <img src="https://github.com/hseong3243.png?size=130">
+            <img src="https://github.com/hseong3243.png?size=100">
         </td>
         <td>
-            <img src="https://github.com/pushedrumex.png?size=130">
+            <img src="https://github.com/pushedrumex.png" width = 100>
         </td>
         <td>
             <img src="https://github.com/bjo6300.png?size=130">
